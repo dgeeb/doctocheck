@@ -30,7 +30,7 @@ def send_email_notification(message_text: str):
         print("⚠️ EMAIL_ADDRESS/EMAIL_PASSWORD not set; skipping email.")
         return
     msg = EmailMessage()
-    msg["Subject"] = "🚨 Doctolib: appointment signal"
+    msg["Subject"] = "✅ Doctolib-checker: running fine"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
     msg.set_content(message_text)
@@ -246,3 +246,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
