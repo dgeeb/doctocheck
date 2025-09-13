@@ -14,21 +14,26 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
 # --------------- Config ---------------
 TEST_URL = "https://www.doctolib.fr/clinique-privee/gap/polyclinique-des-alpes-du-sud"
-HEADLESS_MODE = True         # Set False to watch it interact
-SHOW_POPUP = True
-STEP_TIMEOUT = 20000         # ms for each step
-NO_SLOTS_TIMEOUT_MS = 45000  # Wait up to 45s for the “no slots” UI to appear
+HEADLESS_MODE = True          # Set False to watch it interact locally
+SHOW_POPUP = True             # Windows-only; ignored on GitHub runners
+STEP_TIMEOUT = 20000          # ms per UI step
+SLOTS_WAIT_MS = 40000         # wait up to 40s for real time slots to appear
+NO_SLOTS_WAIT_MS = 30000      # wait up to 30s for the explicit "no slots" UI
+WAIT_AFTER_FLOW_MS = 1500     # small settle wait before detection
+
+# Regex to capture HH:MM without capturing groups (returns the full match strings)
+TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b")
 
 # --------------- Notifications ---------------
-def send_email_notification():
+def send_email_notification(message_text: str):
     if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
         print("⚠️ EMAIL_ADDRESS/EMAIL_PASSWORD not set; skipping email.")
         return
     msg = EmailMessage()
-    msg["Subject"] = "🚨 Appointment Available!"
+    msg["Subject"] = "🚨 Doctolib: appointment signal"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
-    msg.set_content(f"An appointment is available! Open: {TEST_URL}")
+    msg.set_content(message_text)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         smtp.send_message(msg)
@@ -39,7 +44,7 @@ def show_popup(title, message):
     except Exception:
         pass
 
-# --------------- Helpers ---------------
+# --------------- Click helpers ---------------
 def click_first_visible(page, locator, desc, timeout=STEP_TIMEOUT, delay=0.6):
     """Clicks the first visible element for the given locator (Locator or string)."""
     loc = page.locator(locator) if isinstance(locator, str) else locator
@@ -62,25 +67,92 @@ def try_click_variants(page, desc, variants, timeout=STEP_TIMEOUT):
     print(f"⚠️ Could not click {desc}: {last_err}")
     return False
 
-def has_no_slots_ui(page):
-    """
-    Returns True if we detect the 'no appointment' UI:
-    - The big blue button “CHERCHER UN AUTRE SOIGNANT”
-    - OR the long message about appointments not being available
-    """
-    btn_regex = re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I)
-    if page.get_by_role("button", name=btn_regex).first.is_visible():
-        return True
-    if page.get_by_role("link", name=btn_regex).first.is_visible():
-        return True
+# --------------- Detection helpers ---------------
+def find_slot_times_in_frame(frame):
+    """Return a sorted list of visible time labels (HH:MM) within this frame."""
+    times = set()
 
+    # 1) Doctolib slot buttons (common case)
     try:
-        body_text = page.locator("body").inner_text()
+        btns = frame.locator("button.dl-button-slot")
+        count = btns.count()
+        for i in range(min(count, 300)):  # safety cap
+            el = btns.nth(i)
+            if el.is_visible():
+                txt = (el.inner_text(timeout=2000) or "").strip()
+                for m in TIME_RE.finditer(txt):
+                    times.add(m.group(0))
+    except Exception:
+        pass
+
+    # 2) Any clickable elements containing a time label
+    try:
+        generic = frame.locator("button, [role=button], a")
+        count = generic.count()
+        for i in range(min(count, 600)):
+            el = generic.nth(i)
+            if el.is_visible():
+                txt = (el.inner_text(timeout=1200) or "").strip()
+                if ":" in txt:
+                    for m in TIME_RE.finditer(txt):
+                        times.add(m.group(0))
+    except Exception:
+        pass
+
+    return sorted(times)
+
+def any_no_slots_ui_in_frame(frame):
+    """Detect explicit 'no slots' UI in this frame."""
+    btn_regex = re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I)
+    try:
+        if frame.get_by_role("button", name=btn_regex).first.is_visible():
+            return True
+        if frame.get_by_role("link", name=btn_regex).first.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        body_text = frame.locator("body").inner_text()
         if re.search(r"n'est malheureusement pas disponible", body_text, re.I):
             return True
     except Exception:
         pass
     return False
+
+def detect_availability(page):
+    """
+    Returns ('available', times) | ('none', []) | ('unknown', [])
+    - AVAILABLE: we saw time labels (HH:MM) in any frame.
+    - NONE: we saw the explicit 'no slots' UI/message.
+    - UNKNOWN: neither appeared within the wait windows (don’t alert).
+    """
+    # Let the page settle
+    page.wait_for_timeout(WAIT_AFTER_FLOW_MS)
+
+    # 1) Wait for actual slots
+    deadline = time.time() + (SLOTS_WAIT_MS / 1000.0)
+    while time.time() < deadline:
+        for fr in page.frames:
+            times = find_slot_times_in_frame(fr)
+            if times:
+                return ("available", times)
+        page.wait_for_timeout(600)
+
+    # 2) If no slots, wait for explicit "no slots" UI
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(15000, NO_SLOTS_WAIT_MS))
+    except PlaywrightTimeout:
+        pass
+
+    deadline = time.time() + (NO_SLOTS_WAIT_MS / 1000.0)
+    while time.time() < deadline:
+        for fr in page.frames:
+            if any_no_slots_ui_in_frame(fr):
+                return ("none", [])
+        page.wait_for_timeout(600)
+
+    # 3) Neither showed up
+    return ("unknown", [])
 
 # --------------- Main ---------------
 def main():
@@ -90,7 +162,9 @@ def main():
             viewport={"width": 1366, "height": 860},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36")
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            locale="fr-FR",
+            timezone_id="Europe/Paris",
         )
         page = context.new_page()
 
@@ -102,14 +176,14 @@ def main():
                 page,
                 "Accept cookies",
                 [
-                    page.get_by_role("button", name=re.compile("tout accepter|accepter", re.I)),
+                    page.get_by_role("button", name=re.compile("tout accepter|accepter|j'accepte|ok", re.I)),
                     "button:has-text('Accepter')",
                     "button:has-text('TOUT ACCEPTER')",
                 ],
                 timeout=8000,
             )
 
-            # --- Booking flow (mirrors your Selenium steps) ---
+            # --- Booking flow (mirrors your previous steps) ---
             try_click_variants(
                 page,
                 "Prendre rendez-vous",
@@ -151,33 +225,20 @@ def main():
                 ],
             )
 
-            # --- Final detection: wait for 'no slots' UI; if not seen, assume slots ---
-            print("⏳ Checking for 'no slots' UI…")
-            no_slots_detected = False
-            try:
-                page.wait_for_timeout(1500)  # settle
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeout:
-                pass
+            # --------- Availability detection (3-state) ---------
+            state, times = detect_availability(page)
 
-            try:
-                page.get_by_role(
-                    "button",
-                    name=re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I)
-                ).first.wait_for(state="visible", timeout=NO_SLOTS_TIMEOUT_MS)
-                no_slots_detected = True
-            except PlaywrightTimeout:
-                no_slots_detected = has_no_slots_ui(page)
-
-            if no_slots_detected:
-                print("❌ No appointments available (no-slots UI detected).")
+            if state == "available":
+                print(f"✅ Slots found: {times}")
+                send_email_notification(f"Slots found on Doctolib: {', '.join(times)}\n\n{TEST_URL}")
+                if SHOW_POPUP:
+                    show_popup("Doctor Checker", f"Slots: {', '.join(times)}")
+            elif state == "none":
+                print("❌ No appointments (explicit UI).")
                 if SHOW_POPUP:
                     show_popup("Doctor Checker", "No appointment available.")
             else:
-                print("✅ Appointment likely available! (no 'no-slots' UI detected)")
-                send_email_notification()
-                if SHOW_POPUP:
-                    show_popup("Doctor Checker", "Appointment Available!")
+                print("🤷 No positive slots and no explicit 'no-slots' UI → UNKNOWN. Not sending email.")
 
         finally:
             context.close()
