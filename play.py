@@ -4,49 +4,44 @@ import time
 import smtplib
 from email.message import EmailMessage
 from dotenv import load_dotenv
-import ctypes  # Windows popup
+import platform
+from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 
-# --------------- Env ---------------
+# ---------------- Env & config ----------------
 load_dotenv()
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# --------------- Config ---------------
 ECHIROLLES_URL = "https://www.doctolib.fr/cabinet-medical/echirolles/cente-digestif-des-cedres"
-HEADLESS_MODE = True         # Set False to watch it interact
-SHOW_POPUP = True
-STEP_TIMEOUT = 20000         # ms for each step
-NO_SLOTS_TIMEOUT_MS = 45000  # Wait up to 45s for the “no slots” UI to appear
+HEADLESS_MODE = True
+STEP_TIMEOUT = 20000          # ms
+WAIT_AFTER_FLOW_MS = 1500
+SLOTS_WAIT_MS = 40000         # how long to wait for actual slots
+NO_SLOTS_WAIT_MS = 30000      # how long to wait for the "no-slots" UI
+CI = os.getenv("GITHUB_ACTIONS") == "true"
 
-# --------------- Notifications ---------------
-def send_email_notification():
+# Directories for debug artifacts (uploaded in GH Actions)
+ART_DIR = Path(os.getenv("ARTIFACT_DIR", "artifacts"))
+ART_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------- Notifications ----------------
+def send_email_notification(msg_text):
     if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
         print("⚠️ EMAIL_ADDRESS/EMAIL_PASSWORD not set; skipping email.")
         return
     msg = EmailMessage()
-    msg["Subject"] = "🚨 Appointment Available!"
+    msg["Subject"] = "🚨 Doctolib: appointment signal"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
-    msg.set_content(f"An appointment is available! Open: {ECHIROLLES_URL}")
+    msg.set_content(msg_text)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         smtp.send_message(msg)
 
-def show_popup(title, message):
-    try:
-        ctypes.windll.user32.MessageBoxW(0, message, title, 1)
-    except Exception:
-        pass
-
-# --------------- Helpers ---------------
+# ---------------- Helpers ----------------
 def click_first_visible(page, locator, desc, timeout=STEP_TIMEOUT, delay=0.6):
-    """
-    Clicks the first visible element for the given locator (Playwright Locator or string).
-    Avoids strict mode violations and hidden matches.
-    """
     loc = page.locator(locator) if isinstance(locator, str) else locator
-    # wait until at least one is visible
     loc.first.wait_for(state="visible", timeout=timeout)
     loc.first.scroll_into_view_if_needed(timeout=timeout)
     loc.first.click(timeout=timeout)
@@ -55,49 +50,135 @@ def click_first_visible(page, locator, desc, timeout=STEP_TIMEOUT, delay=0.6):
         time.sleep(delay)
 
 def try_click_variants(page, desc, variants, timeout=STEP_TIMEOUT):
-    """
-    Try multiple locator strategies (strings or Locators) until one works.
-    """
     last_err = None
     for i, variant in enumerate(variants, 1):
         try:
             click_first_visible(page, variant, f"{desc} (variant {i})", timeout=timeout)
             return True
-        except PlaywrightTimeout as e:
-            last_err = e
-        except PlaywrightError as e:
+        except (PlaywrightTimeout, PlaywrightError) as e:
             last_err = e
     print(f"⚠️ Could not click {desc}: {last_err}")
     return False
 
-def has_no_slots_ui(page):
-    """
-    Returns True if we detect the 'no appointment' UI:
-    - The big blue button “CHERCHER UN AUTRE SOIGNANT”
-    - OR the long message about appointments not being available
-    Works case-insensitive.
-    """
-    # Button by accessible name (case-insensitive)
-    button = page.get_by_role("button", name=re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I))
-    if button.first.is_visible():
-        return True
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
-    # Also check links styled as buttons just in case
-    link_button = page.get_by_role("link", name=re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I))
-    if link_button.first.is_visible():
-        return True
+def find_slot_times_in_frame(frame):
+    """Return a list of visible time labels (HH:MM) within this frame."""
+    times = set()
 
-    # Fallback: page message substring
+    # Specific Doctolib slot buttons
     try:
-        body_text = page.locator("body").inner_text()
+        btns = frame.locator("button.dl-button-slot")
+        count = btns.count()
+        for i in range(min(count, 200)):  # safety cap
+            el = btns.nth(i)
+            if el.is_visible():
+                txt = el.inner_text(timeout=2000).strip()
+                for m in TIME_RE.findall(txt):
+                    # m is ('HH','MM') due to groups; rebuild time safely:
+                    # But because of groups, use regex on whole text below instead:
+                    pass
+                # simpler: extract all times from this text
+                for t in re.findall(TIME_RE, txt):
+                    # When using grouping, t could be a tuple; normalize:
+                    if isinstance(t, tuple):
+                        # t[0] is hour; we need the original match; rerun:
+                        for mm in re.finditer(r"\b([01]?\d|2[0-3]):[0-5]\d\b", txt):
+                            times.add(mm.group(0))
+                    else:
+                        times.add(t)
+    except Exception:
+        pass
+
+    # Generic: any clickable with a time
+    try:
+        generic = frame.locator("button, [role=button], a")
+        count = generic.count()
+        for i in range(min(count, 400)):
+            el = generic.nth(i)
+            if el.is_visible():
+                txt = (el.inner_text(timeout=1000) or "").strip()
+                if ":" in txt and TIME_RE.search(txt):
+                    # add every time-like token
+                    for mm in re.finditer(r"\b([01]?\d|2[0-3]):[0-5]\d\b", txt):
+                        times.add(mm.group(0))
+    except Exception:
+        pass
+
+    return sorted(times)
+
+def any_no_slots_ui_in_frame(frame):
+    """Detect explicit 'no slots' UI in this frame."""
+    btn_regex = re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I)
+    try:
+        if frame.get_by_role("button", name=btn_regex).first.is_visible():
+            return True
+        if frame.get_by_role("link", name=btn_regex).first.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        body_text = frame.locator("body").inner_text()
         if re.search(r"n'est malheureusement pas disponible", body_text, re.I):
             return True
     except Exception:
         pass
-
     return False
 
-# --------------- Main ---------------
+def detect_availability(page):
+    """
+    Returns ('available', times) | ('none', []) | ('unknown', [])
+    We wait for positive proof of slots; otherwise check explicit 'no slots';
+    if neither shows up, we return 'unknown' (no email; log artifacts).
+    """
+    # Small settle
+    page.wait_for_timeout(WAIT_AFTER_FLOW_MS)
+
+    # 1) Wait up to SLOTS_WAIT_MS for any slot button/time to appear (in page or any frame)
+    deadline = time.time() + (SLOTS_WAIT_MS / 1000.0)
+    while time.time() < deadline:
+        # check main page + frames
+        for fr in page.frames:
+            times = find_slot_times_in_frame(fr)
+            if times:
+                return ("available", times)
+        page.wait_for_timeout(600)
+
+    # 2) If no slots found, wait up to NO_SLOTS_WAIT_MS for an explicit "no slots" UI
+    try:
+        page.wait_for_timeout(600)
+        page.wait_for_load_state("networkidle", timeout=min(15000, NO_SLOTS_WAIT_MS))
+    except PlaywrightTimeout:
+        pass
+
+    deadline = time.time() + (NO_SLOTS_WAIT_MS / 1000.0)
+    while time.time() < deadline:
+        for fr in page.frames:
+            if any_no_slots_ui_in_frame(fr):
+                return ("none", [])
+        page.wait_for_timeout(600)
+
+    # 3) Neither appeared: unknown (don’t alert)
+    return ("unknown", [])
+
+def save_artifacts(page, label="final"):
+    try:
+        page.screenshot(path=str(ART_DIR / f"{label}.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        html = page.content()
+        (ART_DIR / f"{label}.html").write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        # Light text dump (helps search in logs)
+        body_text = page.locator("body").inner_text(timeout=3000)
+        (ART_DIR / f"{label}.txt").write_text(body_text[:20000], encoding="utf-8")
+    except Exception:
+        pass
+
+# ---------------- Main ----------------
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS_MODE, args=["--disable-gpu"])
@@ -105,27 +186,28 @@ def main():
             viewport={"width": 1366, "height": 860},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36")
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            locale="fr-FR",
+            timezone_id="Europe/Paris",
         )
         page = context.new_page()
 
         try:
             page.goto(ECHIROLLES_URL, wait_until="domcontentloaded", timeout=60000)
 
-            # Cookie banner
+            # Cookie banner (varies a lot on runners)
             try_click_variants(
                 page,
                 "Accept cookies",
                 [
-                    page.get_by_role("button", name=re.compile("tout accepter|accepter", re.I)),
+                    page.get_by_role("button", name=re.compile("tout accepter|accepter|j'accepte|ok", re.I)),
                     "button:has-text('Accepter')",
                     "button:has-text('TOUT ACCEPTER')",
                 ],
                 timeout=8000,
             )
 
-            # --- Booking flow (robust, role-first selectors) ---
-            # "Prendre rendez-vous" is usually a link with accessible name
+            # Booking flow (same as before)
             try_click_variants(
                 page,
                 "Prendre rendez-vous",
@@ -134,8 +216,6 @@ def main():
                     "xpath=//*[contains(.,'Prendre rendez-vous') and (self::a or self::button)]",
                 ],
             )
-
-            # 'Non' (new patient)
             try_click_variants(
                 page,
                 "Non",
@@ -144,8 +224,6 @@ def main():
                     "xpath=//button[.//p[normalize-space()='Non']]",
                 ],
             )
-
-            # 'Au cabinet'
             try_click_variants(
                 page,
                 "Au cabinet",
@@ -154,8 +232,6 @@ def main():
                     "xpath=//button[.//p[normalize-space()='Au cabinet']]",
                 ],
             )
-
-            # Première consultation d'hépato-gastro-entérologie
             try_click_variants(
                 page,
                 "Première consultation d'hépato-gastro-entérologie",
@@ -164,8 +240,6 @@ def main():
                     "xpath=//button[.//*[contains(., \"Première consultation d'hépato-gastro-entérologie\")]]",
                 ],
             )
-
-            # Je n'ai pas de préférence
             try_click_variants(
                 page,
                 "Je n'ai pas de préférence",
@@ -175,37 +249,17 @@ def main():
                 ],
             )
 
-            # --- Final detection: wait for 'no slots' UI; if not seen, assume slots ---
-            print("⏳ Checking for 'no slots' UI…")
-            no_slots_detected = False
+            # --------- Availability detection (new 3-state) ---------
+            state, times = detect_availability(page)
+            save_artifacts(page, label=f"state_{state}")
 
-            # Prefer waiting for a stable UI state
-            try:
-                # Wait for either the button or the appointment area to load something
-                page.wait_for_timeout(1500)  # tiny settle time
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeout:
-                pass
-
-            try:
-                # Wait specifically for the 'no slots' button to show up; if timeout, we'll check fallback
-                page.get_by_role("button", name=re.compile(r"cherch(er)?\s+un\s+autre\s+(soignant|professionnel|praticien)", re.I))\
-                    .first.wait_for(state="visible", timeout=NO_SLOTS_TIMEOUT_MS)
-                no_slots_detected = True
-            except PlaywrightTimeout:
-                # Fallback: scan message / other variants
-                no_slots_detected = has_no_slots_ui(page)
-
-            if no_slots_detected:
-                print("❌ No appointments available (no-slots UI detected).")
-                if SHOW_POPUP:
-                    show_popup("Doctor Checker", "No appointment available.")
+            if state == "available":
+                print(f"✅ Slots found: {times}")
+                send_email_notification(f"Slots found on Doctolib: {', '.join(times)}\n\n{ECHIROLLES_URL}")
+            elif state == "none":
+                print("❌ No appointments (explicit UI).")
             else:
-                print("✅ Appointment likely available! (no 'no-slots' UI detected)")
-                send_email_notification()
-                if SHOW_POPUP:
-                    show_popup("Doctor Checker", "Appointment Available!")
-
+                print("🤷 No positive signal and no 'no-slots' UI → UNKNOWN. Not sending email.")
         finally:
             context.close()
             browser.close()
